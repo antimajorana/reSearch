@@ -197,6 +197,11 @@ export function loadModels(refresh = false) {
     if (revision !== loadRevision) return;
     pickChoice(null);
     render();
+    try {
+      if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+        document.dispatchEvent(new CustomEvent('research:models-updated', { detail: { providers: groups } }));
+      }
+    } catch { /* non-DOM test harness */ }
   })();
   return loading;
 }
@@ -253,6 +258,10 @@ function pickChoice(preferred) {
 // Provider and model for the next message, or null when nothing usable is connected.
 export function getModelChoice() {
   return choice && findModel(choice) ? { ...choice } : null;
+}
+
+export function getConnectedModelGroups() {
+  return groups.map((g) => ({ ...g, models: Array.isArray(g.models) ? [...g.models] : [] }));
 }
 
 // Why getModelChoice() is null when models exist but none fits the session's route

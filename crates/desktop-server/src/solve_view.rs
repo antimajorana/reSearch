@@ -81,13 +81,11 @@ fn run_state_key(state: RunState) -> &'static str {
     }
 }
 
-fn has_leg_activity(events: &[Event]) -> bool {
-    events.iter().any(|ev| {
-        matches!(
-            ev.kind.as_str(),
-            "session.start" | "session.resume" | "model.request" | "tool.request"
-        )
-    })
+fn last_leg_ended_cleanly(events: &[Event]) -> Option<bool> {
+    if let Some(idx) = events.iter().rposition(|ev| matches!(ev.kind.as_str(), "session.start" | "session.resume")) {
+        return Some(events[idx + 1..].iter().any(|ev| ev.kind == "session.end"));
+    }
+    events.iter().any(|ev| matches!(ev.kind.as_str(), "model.request" | "tool.request")).then_some(false)
 }
 
 fn done_open_items(state: &SolveState) -> Value {
@@ -139,13 +137,12 @@ fn build_run_state_json(
                     .unwrap_or_else(|| json!([]));
                 (run_state_key(mapped), mapped.label(), Some(r.as_str().to_string()), open_items)
             }
-            SolveRunStatus::Running if has_leg_activity(events) => (
-                run_state_key(RunState::Interrupted),
-                RunState::Interrupted.label(),
-                Some("interrupted".to_string()),
-                json!([]),
-            ),
-            SolveRunStatus::Idle | SolveRunStatus::Running => {
+            SolveRunStatus::Running => match last_leg_ended_cleanly(events) {
+                Some(true) => (run_state_key(RunState::Paused), RunState::Paused.label(), Some("end_turn".to_string()), json!([])),
+                Some(false) => (run_state_key(RunState::Interrupted), RunState::Interrupted.label(), Some("interrupted".to_string()), json!([])),
+                None => (RUN_STATE_READY, RUN_STATE_READY_LABEL, None, json!([])),
+            },
+            SolveRunStatus::Idle => {
                 (RUN_STATE_READY, RUN_STATE_READY_LABEL, None, json!([]))
             }
         }

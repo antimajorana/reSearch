@@ -51,10 +51,22 @@ fn reply(m: &Mock, r: &Recorded) -> Reply {
         ("GET", "/v1/models") => Reply::json(200, &json!({ "models": [
             { "slug": "gpt-test-sol", "display_name": "GPT Test", "visibility": "list" },
             { "slug": "gpt-hidden", "display_name": "Hidden", "visibility": "hide" } ] })),
-        ("POST", "/v1/responses") => match m.streams.lock().unwrap().pop_front() {
-            Some(body) => Reply { status: 200, content_type: "text/event-stream", body },
-            None => Reply::json(500, &json!({ "error": { "code": "exhausted" } })),
-        },
+        ("POST", "/v1/responses") => {
+            let parsed: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+            if parsed["input"].as_array().is_none_or(Vec::is_empty) {
+                return Reply::json(400, &json!({
+                    "error": {
+                        "code": "missing_required_parameter",
+                        "param": "input",
+                        "message": "One of \"input\" or \"previous_response_id\" or 'prompt' or 'conversation' must be provided."
+                    }
+                }));
+            }
+            match m.streams.lock().unwrap().pop_front() {
+                Some(body) => Reply { status: 200, content_type: "text/event-stream", body },
+                None => Reply::json(500, &json!({ "error": { "code": "exhausted" } })),
+            }
+        }
         _ => Reply::json(404, &json!({})),
     }
 }
@@ -349,6 +361,120 @@ fn chatgpt_turn_refused_without_signin_or_plan_scope_and_ignores_generic_key() {
 
     let _ = wait_turn_error(&sid);
     assert!(!mock.requests().iter().any(|r| r.path == "/v1/responses"));
+    assert_eq!(call_api("POST", "/api/connections/chatgpt/logout", Value::Null).0, 200);
+    srv.shutdown();
+}
+
+#[test]
+fn solve_first_turn_on_chatgpt_responses_route_with_not_selected_solver_and_empty_continue_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    let state = Arc::new(Mock {
+        nonce: Mutex::new(String::new()),
+        issuer: Mutex::new(String::new()),
+        streams: Mutex::new(VecDeque::new()),
+    });
+    let text = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "The integral evaluates to 1/3." }]
+    });
+    state.streams.lock().unwrap().push_back(sse(&[completed("resp_solve_1", text)]));
+    let s2 = Arc::clone(&state);
+    let mock = MockAuth::start(Arc::new(move |r: &Recorded| reply(&s2, r)));
+    *state.issuer.lock().unwrap() = mock.base.clone();
+
+    let mut cfg = test_cfg(&data, None, Some("http://127.0.0.1:9".into()), None);
+    cfg.chatgpt_test = Some(ChatGptTestHooks {
+        mock_base: mock.base.clone(),
+        opener: Arc::new(|_| Ok(())),
+        login_timeout: Duration::from_secs(60),
+    });
+    let srv = start_desktop_server(cfg).unwrap();
+    let port = srv.addr.port();
+    let tok = srv.info.token.clone();
+    let h = [("X-ReSearch-Token", tok.as_str()), ("Content-Type", "application/json")];
+    let call_api = |method: &str, path: &str, body: Value| -> (u16, Value) {
+        let raw = if body.is_null() { Vec::new() } else { serde_json::to_vec(&body).unwrap() };
+        let (st, _, b) = raw_http(port, method, path, &h, &raw);
+        (st, serde_json::from_slice(&b).unwrap_or(Value::Null))
+    };
+
+    // Sign in with ChatGPT ONLY (no API keys, no default_provider in ui_settings).
+    let url = call_api("POST", "/api/connections/chatgpt/login", Value::Null).1["authorize_url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    *state.nonce.lock().unwrap() = url_param(&url, "nonce").unwrap();
+    let redirect = url_param(&url, "redirect_uri").unwrap();
+    let cb_port: u16 = redirect
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let st_param = url_param(&url, "state").unwrap();
+    assert_eq!(
+        browser_get(cb_port, &format!("/auth/callback?code={}&state={st_param}&client_id=oaiapp_desk", SECRETS[2]))
+            .unwrap()
+            .0,
+        200
+    );
+
+    // Exact v0.2.0 smoke repro: new Solve session, Solver = Not selected, Verifier = chatgpt / gpt-6.2-sol,
+    // statement = "Compute the integral $\int_0^1 x^2\,dx$.", then `POST .../solve/continue` with `{}`.
+    let (st, created) = call_api("POST", "/api/sessions", json!({ "mode": "solve" }));
+    assert_eq!(st, 200, "{created}");
+    let sid = created["id"].as_str().unwrap().to_string();
+
+    let (st, setup_res) = call_api(
+        "POST",
+        &format!("/api/sessions/{sid}/solve/setup"),
+        json!({
+            "statement": "Compute the integral $\\int_0^1 x^2\\,dx$.",
+            "task_kind": "calculate",
+            "target": { "description": "Final calculated expression", "form": "closed_form" },
+            "done": [{ "id": "no_open_flags", "kind": "no_open_flags", "params": {} }],
+            "conventions": "",
+            "symbols": [{ "name": "x", "assumptions": ["real"] }],
+            "dimensions": {},
+            "assumptions": [],
+            "roles": {
+                "solver": { "provider": "", "model": "" },
+                "verifier": { "provider": "chatgpt", "model": "gpt-6.2-sol" }
+            },
+            "ask_before_running": false
+        }),
+    );
+    assert_eq!(st, 200, "{setup_res}");
+
+    let (st, cont_res) = call_api("POST", &format!("/api/sessions/{sid}/solve/continue"), json!({}));
+    assert_eq!(st, 202, "{cont_res}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let ledger = ledger::Ledger::open(&data).unwrap();
+    while std::time::Instant::now() < deadline {
+        let evs = ledger.read_session(&sid).unwrap();
+        if evs.iter().any(|e| e.kind == "session.end" || e.kind == "solve.paused") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let evs = ledger.read_session(&sid).unwrap();
+    assert!(evs.iter().any(|e| e.kind == "model.response"), "expected model.response, got {evs:#?}");
+    assert!(!evs.iter().any(|e| e.kind == "model.error"), "must not emit model.error: {evs:#?}");
+    let (_, view) = call_api("GET", &format!("/api/sessions/{sid}/solve/view"), Value::Null);
+    assert!(view["run_state"]["model_calls_used"].as_u64().unwrap_or(0) >= 1, "{view}");
+    assert_ne!(view["run_state"]["state"], json!("interrupted"), "{view}");
+
+    let resp_req = mock.requests().into_iter().find(|r| r.path == "/v1/responses").expect("/v1/responses request");
+    let wire: Value = serde_json::from_str(&resp_req.body).unwrap();
+    let input = wire["input"].as_array().expect("input array");
+    assert!(!input.is_empty());
+    assert!(input[0]["content"].as_str().unwrap_or("").contains("\\int_0^1 x^2\\,dx"));
+
     assert_eq!(call_api("POST", "/api/connections/chatgpt/logout", Value::Null).0, 200);
     srv.shutdown();
 }

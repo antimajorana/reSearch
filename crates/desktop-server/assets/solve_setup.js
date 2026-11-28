@@ -175,6 +175,8 @@ export function createSolveSetupView(host, options = {}) {
   }
 
   async function submitSetup() {
+    if (prefillTimer) { clearTimeout(prefillTimer); prefillTimer = null; }
+    prefillSeq += 1;
     const payload = buildSetupSubmission(state);
     if (!payload.statement) {
       state.error = 'Enter a problem statement before running.';

@@ -205,6 +205,9 @@ pub fn serialize_responses_request(req: &ModelRequest) -> Result<Vec<u8>, Transp
     for msg in &req.messages {
         encode_message(msg, &mut input)?;
     }
+    if input.is_empty() {
+        return Err(config_err("request has no input messages"));
+    }
     obj.insert("input".into(), Value::Array(input));
     if !req.tools.is_empty() {
         obj.insert(
@@ -264,7 +267,7 @@ fn encode_message(msg: &Message, out: &mut Vec<Value>) -> Result<(), TransportEr
                         "call_id": tool_use_id,
                         "output": content,
                     })),
-                    ContentBlock::Text { text: t } if !t.is_empty() => text.push(t.as_str()),
+                    ContentBlock::Text { text: t } if !t.trim().is_empty() => text.push(t.as_str()),
                     _ => {}
                 }
             }
@@ -583,5 +586,14 @@ mod tests {
         assert!(e.message.contains("sign in again") && !e.message.contains("raw-detail-leak"));
         let e = mk(TransportErrorKind::HttpStatus, 502, "HTTP 502: raw-html-leak", b"<html>raw-html-leak</html>");
         assert_eq!(e.message, "HTTP 502");
+    }
+
+    #[test]
+    fn serialize_rejects_empty_or_blank_user_turn_without_emitting_empty_input() {
+        for txt in ["", "   \n\t "] {
+            let req = ModelRequest { model: "gpt-6.2-sol".into(), system: Some("sys".into()), messages: vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: txt.into() }] }], tools: Vec::new(), max_tokens: 1024, reasoning_effort: None };
+            let err = serialize_responses_request(&req).expect_err("empty user turn must fail locally");
+            assert!(err.kind == TransportErrorKind::Config && err.message.contains("no input messages"), "{err}");
+        }
     }
 }

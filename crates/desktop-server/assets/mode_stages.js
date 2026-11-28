@@ -65,6 +65,40 @@ function normalizeMode(raw) {
   return (norm === 'investigation' || norm === 'investigate') ? 'investigate' : 'research';
 }
 
+const CLI_ROUTE_PROVIDERS = new Set(['claude-cli', 'antigravity']);
+
+export function normalizeConnectedModels(raw) {
+  const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.providers) ? raw.providers : []);
+  const out = [];
+  const seen = new Set();
+  const pushItem = (provider, model, label) => {
+    const p = String(provider || '').trim();
+    const m = String(model || '').trim();
+    if (!p || !m || CLI_ROUTE_PROVIDERS.has(p)) return;
+    const key = `${p}::${m}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ provider: p, model: m, label: String(label || `${p} / ${m}`) });
+  };
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    if (Array.isArray(item.models)) {
+      if (CLI_ROUTE_PROVIDERS.has(item.id) || CLI_ROUTE_PROVIDERS.has(item.route)) continue;
+      const groupLabel = String(item.label || item.id || '').trim();
+      for (const m of item.models) {
+        if (!m || typeof m !== 'object') continue;
+        const prov = m.provider || item.id;
+        const modId = m.id || m.model;
+        const modLabel = String(m.label || modId || '').trim();
+        pushItem(prov, modId, groupLabel ? `${groupLabel} / ${modLabel}` : modLabel);
+      }
+    } else {
+      pushItem(item.provider, item.model || item.id, item.label);
+    }
+  }
+  return out;
+}
+
 function detectModelConnected(deps) {
   if (typeof deps.isModelConnected === 'function') return Boolean(deps.isModelConnected());
   const sel = typeof document !== 'undefined' && typeof document.getElementById === 'function' ? document.getElementById('composer-model') : null;
@@ -89,6 +123,8 @@ export function createModeStagesController(deps = {}) {
   let activeSolveArtifacts = null;
   let activeLessonsWidget = null;
   let activeExploreCtrl = null;
+  let activeModelsCleanup = null;
+  let solvePollTimer = null;
   let creatingSolve = false;
   let inFlightMount = null;
 
@@ -143,7 +179,24 @@ export function createModeStagesController(deps = {}) {
       : fetchJson('POST', `/api/sessions/${encSid}/approvals/${encodeURIComponent(callId)}`, payload);
   }
 
+  async function resolveConnectedModels() {
+    if (typeof deps.listConnectedModels === 'function') {
+      try { return normalizeConnectedModels(await deps.listConnectedModels()); } catch { return []; }
+    }
+    if (!customFetch && typeof apiMod?.getModels === 'function') {
+      try { return normalizeConnectedModels(await apiMod.getModels(false)); } catch { return []; }
+    }
+    return [];
+  }
+
   function destroySolveWidgets() {
+    if (solvePollTimer) {
+      clearTimeout(solvePollTimer);
+      solvePollTimer = null;
+    }
+    if (activeModelsCleanup) {
+      try { activeModelsCleanup(); } finally { activeModelsCleanup = null; }
+    }
     if (activeSolveWorkspace) {
       try {
         activeSolveWorkspace.destroy();
@@ -192,8 +245,12 @@ export function createModeStagesController(deps = {}) {
       solveHost.hidden = false;
 
       const encSid = encodeURIComponent(sessionId);
-      const viewData = await fetchJson('GET', `/api/sessions/${encSid}/solve/view`);
+      const [viewData, initialModels] = await Promise.all([
+        fetchJson('GET', `/api/sessions/${encSid}/solve/view`),
+        resolveConnectedModels(),
+      ]);
       if (seq !== syncSeq) return null;
+      let connectedModels = initialModels;
 
       const doc = solveHost.ownerDocument || (typeof document !== 'undefined' ? document : null);
       const makeSlot = (cls) => {
@@ -216,6 +273,21 @@ export function createModeStagesController(deps = {}) {
         scheduleRevoke: deps.scheduleRevoke,
       };
 
+      const scheduleRunningPoll = () => {
+        if (solvePollTimer) { clearTimeout(solvePollTimer); solvePollTimer = null; }
+        if (seq !== syncSeq || (customFetch && deps.pollIntervalMs == null)) return;
+        const isRunning = Boolean(currentView?.run_state?.running || currentView?.run_state?.state === 'running');
+        if (!isRunning) return;
+        solvePollTimer = setTimeout(async () => {
+          solvePollTimer = null;
+          if (seq !== syncSeq) return;
+          try {
+            const polled = await fetchJson('GET', `/api/sessions/${encSid}/solve/view`);
+            applyUpdatedView(polled);
+          } catch { /* transient poll failure */ }
+        }, deps.pollIntervalMs ?? 1000);
+      };
+
       const applyUpdatedView = (nextView, { updateSetup = true } = {}) => {
         if (!nextView || typeof nextView !== 'object' || seq !== syncSeq) return currentView;
         currentView = { ...(currentView || {}), ...nextView };
@@ -226,6 +298,7 @@ export function createModeStagesController(deps = {}) {
           if (activeLessonsWidget) activeLessonsWidget.update(currentView.lessons_supplied);
           else activeLessonsWidget = mountUsedLessonsDisclosure(lessonsSlot, currentView.lessons_supplied, deps);
         }
+        scheduleRunningPoll();
         return currentView;
       };
 
@@ -240,12 +313,25 @@ export function createModeStagesController(deps = {}) {
       };
 
       const view = createSolveSetupView(setupSlot, {
-        initial: { modelConnected: detectModelConnected(deps) },
+        initial: {
+          modelConnected: connectedModels.length > 0 || detectModelConnected(deps),
+          connectedModels,
+        },
         onPrefill: (body) => (seq === syncSeq ? fetchJson('POST', `/api/sessions/${encSid}/solve/prefill`, body) : Promise.resolve(null)),
         onSubmitSetup: async (body) => {
+          const hadSetup = Boolean(currentView?.setup);
           const res = await fetchJson('POST', `/api/sessions/${encSid}/solve/setup`, body);
           if (res?.view || res?.artifacts) {
             applyUpdatedView(res.view || res, { updateSetup: false });
+          }
+          const hasModel = Boolean(
+            res?.view?.model_connected || currentView?.model_connected || connectedModels.length > 0 || detectModelConnected(deps),
+          );
+          if (!hadSetup && !body?.ask_before_running && hasModel && seq === syncSeq) {
+            try {
+              const cont = await postAndRefresh(`/api/sessions/${encSid}/solve/continue`, {});
+              return { ...(res && typeof res === 'object' ? res : {}), view: cont?.view || currentView, started: true };
+            } catch { /* setup already saved */ }
           }
           return res;
         },
@@ -253,7 +339,22 @@ export function createModeStagesController(deps = {}) {
         onDenyGrant: (grant) => resolveGrant(sessionId, grant, false),
         ...(deps.solveOpts || {}),
       });
-      if (viewData) view.applyView(viewData);
+      if (viewData) {
+        view.applyView({ ...viewData, model_connected: Boolean(viewData.model_connected || connectedModels.length > 0) });
+      }
+      if (typeof doc?.addEventListener === 'function') {
+        const onModelsUpdated = (ev) => {
+          if (seq !== syncSeq || !activeSolveView) return;
+          connectedModels = normalizeConnectedModels(ev?.detail);
+          activeSolveView.applyView({
+            connected_models: connectedModels,
+            model_connected: connectedModels.length > 0 || detectModelConnected(deps),
+          });
+        };
+        doc.addEventListener('research:models-updated', onModelsUpdated);
+        activeModelsCleanup = () => doc.removeEventListener?.('research:models-updated', onModelsUpdated);
+      }
+      scheduleRunningPoll();
       if (currentView?.lessons_supplied?.count > 0) {
         activeLessonsWidget = mountUsedLessonsDisclosure(lessonsSlot, currentView.lessons_supplied, deps);
       }

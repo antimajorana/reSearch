@@ -383,3 +383,73 @@ fn solve_finish_runs_desktop_verifier_before_done_criteria_evaluation() {
     srv.shutdown();
     mock.finish();
 }
+
+#[test]
+fn fresh_solve_continue_with_empty_body_uses_setup_statement_and_solver_role() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let ledger = Ledger::open(&data_dir).unwrap();
+    let mut setup = setup_payload();
+    setup["statement"] = json!("Compute the integral \\int_0^1 x^2\\,dx.");
+    setup["roles"]["solver"] = json!({ "provider": "openai", "model": "gpt-4.1" });
+    ledger
+        .append_with_hash("s-solve-fresh", event_kinds::SOLVE_STARTED, 1, &json!({ "origin": "new" }))
+        .unwrap();
+    ledger
+        .append_with_hash("s-solve-fresh", event_kinds::SOLVE_SETUP, 1, &setup)
+        .unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        data_dir.join("providers.json"),
+        serde_json::to_vec(&json!({
+            "providers": { "openai": { "api_key": "sk-test-openai-fresh" } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mock = MockHttp::start(vec![MockReply {
+        status: 200,
+        content_type: "application/json",
+        body: serde_json::to_vec(&json!({
+            "id": "chatcmpl_fresh_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "1/3" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35 }
+        }))
+        .unwrap(),
+    }]);
+    let srv = start_desktop_server(test_cfg(&data_dir, None, Some(mock.base_url.clone()), None)).unwrap();
+    let port = srv.addr.port();
+    let auth = [("X-ReSearch-Token", srv.info.token.as_str()), ("Content-Type", "application/json")];
+
+    let (st, _, raw) = raw_http(port, "POST", "/api/sessions/s-solve-fresh/solve/continue", &auth, b"{}");
+    assert_eq!(st, 202, "{}", String::from_utf8_lossy(&raw));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let evs = ledger.read_session("s-solve-fresh").unwrap();
+        if evs.iter().any(|e| e.kind == "session.end" || e.kind == event_kinds::SOLVE_PAUSED) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let evs = ledger.read_session("s-solve-fresh").unwrap();
+    assert!(evs.iter().any(|e| e.kind == "session.end"), "expected completion, got {evs:#?}");
+    let req_ev = evs.iter().find(|e| e.kind == "model.request").expect("model.request");
+    assert_eq!(req_ev.payload["model"], "gpt-4.1");
+    let blob_id = req_ev.payload["raw_blob"].as_str().expect("raw_blob");
+    let sent_body: Value = serde_json::from_slice(&ledger.get_blob(blob_id).unwrap()).unwrap();
+    let msgs = sent_body["messages"].as_array().expect("messages array");
+    let user_msg = msgs.iter().rev().find(|m| m["role"] == "user").expect("user turn");
+    let user_text = user_msg["content"].as_str().unwrap_or("");
+    assert!(!user_text.trim().is_empty(), "user turn must not be empty");
+    assert!(user_text.contains("\\int_0^1 x^2\\,dx"), "user turn must contain setup statement: {user_text}");
+    srv.shutdown();
+    mock.finish();
+}

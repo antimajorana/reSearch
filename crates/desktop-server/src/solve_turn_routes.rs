@@ -25,6 +25,53 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+fn resolve_solve_solver_model(
+    state: &DesktopState,
+    subagent: Option<&crate::subagents::SubagentDef>,
+    req: &Value,
+    setup: Option<&research_tools::solve_model::SolveSetup>,
+    meta: Option<&crate::state::SessionMeta>,
+    ui: &crate::state::UiSettings,
+) -> Result<(agent::ProviderKind, String, String), String> {
+    let has_subagent_override = subagent
+        .and_then(|sa| sa.provider.as_deref().zip(sa.model.as_deref()))
+        .is_some_and(|(p, m)| !p.trim().is_empty() && !m.trim().is_empty());
+    let req_p = req
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if has_subagent_override || req_p.is_some() {
+        return crate::agent_models::resolve_orchestrator_model(subagent, req, meta, ui);
+    }
+    if let Some(solver) = setup.map(|s| &s.roles.solver) {
+        let p_raw = solver.provider.trim();
+        if !p_raw.is_empty() {
+            if crate::cli_turn::CliRouteKind::from_provider(&p_raw.to_ascii_lowercase()).is_some() {
+                return Err("Solve continuation requires an in-core API or ChatGPT provider".into());
+            }
+            let pk = agent::ProviderKind::parse(p_raw)?;
+            let m_raw = solver.model.trim();
+            let requested = if m_raw.is_empty() { pk.default_model() } else { m_raw }.to_string();
+            let resolved = pk.resolve_model(&requested);
+            return Ok((pk, requested, resolved));
+        }
+    }
+    let has_configured_orch = meta
+        .and_then(|m| m.default_provider.as_deref())
+        .is_some_and(|s| !s.trim().is_empty())
+        || ui.agent_models.contains_key("orchestrator")
+        || ui.default_provider.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !has_configured_orch {
+        if let Ok((pk, model)) =
+            crate::agent_models::resolve_in_core_role_model(state, "orchestrator", Some(req), true)
+        {
+            return Ok((pk, model.clone(), model));
+        }
+    }
+    crate::agent_models::resolve_orchestrator_model(subagent, req, meta, ui)
+}
+
 pub(crate) fn run_desktop_solve_turn(
     state: &Arc<DesktopState>,
     session_id: &str,
@@ -35,13 +82,18 @@ pub(crate) fn run_desktop_solve_turn(
     if cancel.is_cancelled() {
         return Err("stopped by user".into());
     }
+    let ledger = state.open_ledger()?;
+    let existing = ledger.read_session(session_id).map_err(|e| e.to_string())?;
+    let solve_state = SolveState::from_events(&existing);
     let meta = state.load_meta(session_id);
     let ui = state.load_ui_settings();
     let (reasoning_effort, subagent) =
         crate::subagents::resolve_turn_options(state, session_id, req, meta.clone());
-    let (provider, model_requested, model) = crate::agent_models::resolve_orchestrator_model(
+    let (provider, model_requested, model) = resolve_solve_solver_model(
+        state,
         subagent.as_ref(),
         req,
+        solve_state.setup.as_ref(),
         meta.as_ref(),
         &ui,
     )?;
@@ -58,8 +110,6 @@ pub(crate) fn run_desktop_solve_turn(
     };
     let transport = state.build_transport(provider, &model)?;
     let bundle = build_solve_router(Arc::clone(state), Arc::clone(&env), session_id)?;
-    let ledger = state.open_ledger()?;
-    let existing = ledger.read_session(session_id).map_err(|e| e.to_string())?;
     let mut sink = SseEventSink::new(Arc::clone(&state.sse), session_id).with_model_title(false);
     let hooks = crate::solve_host_hooks::DesktopSolveHostHooks::new(
         Arc::clone(state),
@@ -155,8 +205,15 @@ pub fn handle_continue(state: &Arc<DesktopState>, session_id: &str, body: &[u8])
     if meta.as_ref().and_then(|m| m.route.as_deref()).is_some_and(|r| matches!(r, "claude-cli" | "antigravity")) {
         return Err(bad("Solve continuation requires an in-core API or ChatGPT provider"));
     }
-    let _ = crate::agent_models::resolve_orchestrator_model(None, &req, meta.as_ref(), &ui)
-        .map_err(bad)?;
+    let _ = resolve_solve_solver_model(
+        state,
+        None,
+        &req,
+        solve_state.setup.as_ref(),
+        meta.as_ref(),
+        &ui,
+    )
+    .map_err(bad)?;
 
     let activity = reserve_turn(state, session_id)?;
     {

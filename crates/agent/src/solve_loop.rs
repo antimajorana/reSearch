@@ -162,6 +162,17 @@ pub fn run_solve_loop(
         prompt_extra.push(p.prompt_section.as_str());
     }
     let system_prompt = build_solve_system_prompt(&setup, &prompt_extra);
+    let first_user_text = if cfg.prompt.trim().is_empty() {
+        let stmt = setup.statement.trim();
+        if stmt.is_empty() {
+            "Solve the problem stated in the instructions.".to_string()
+        } else {
+            format!("Solve the problem stated in the instructions.\n\n## Problem\n{stmt}")
+        }
+    } else {
+        cfg.prompt.clone()
+    };
+    let first_user_text_sha256 = ledger::sha256_hex(first_user_text.as_bytes());
     let mut audit = Audit {
         ledger,
         session,
@@ -179,6 +190,7 @@ pub fn run_solve_loop(
             "model_requested": cfg.model_requested,
             "model": cfg.model,
             "prompt": cfg.prompt,
+            "first_user_text_sha256": first_user_text_sha256,
             "system_prompt": system_prompt,
             "max_turns": setup.budgets.max_model_calls_per_leg,
             "max_tokens": cfg.max_tokens,
@@ -211,7 +223,7 @@ pub fn run_solve_loop(
     };
     let initial_messages = vec![Message {
         role: Role::User,
-        content: vec![ContentBlock::Text { text: cfg.prompt.clone() }],
+        content: vec![ContentBlock::Text { text: first_user_text }],
     }];
     let ctx = LegContext {
         leg: 1,

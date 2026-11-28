@@ -495,3 +495,50 @@ fn fresh_run_supplies_matching_lessons_once_and_resume_uses_frozen_brief() {
     let report = ledger.verify_all().unwrap();
     assert_eq!(report.unreferenced_blobs, 0);
 }
+
+#[test]
+fn run_solve_loop_empty_or_whitespace_prompt_seeds_first_user_turn_from_setup_statement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(tmp.path()).unwrap();
+    for (idx, raw_prompt) in [(1, ""), (2, "  \n\t  ")] {
+        let sid = format!("s-empty-prompt-{idx}");
+        seed_setup(&ledger, &sid, 48, 60, 3);
+        let (_, router, gate) = make_solve_router(
+            tmp.path(),
+            &sid,
+            Arc::new(StubEpoch(Arc::new(AtomicU64::new(1)), true)),
+            Arc::new(|_: &CallCtx<'_>, _: &Value| Ok(json!({}))),
+            Arc::new(TestApproveAll),
+        );
+        let mut cfg = base_cfg(Arc::new(ResearchEnv::new(tmp.path())), gate);
+        cfg.prompt = raw_prompt.into();
+        let tr = MockTransport::new(vec![end_resp("1+1 = 2.")]);
+        let out = run_solve_loop(&tr, &router, &ledger, &cfg, &mut NoopSink).unwrap();
+        assert_eq!(out, SessionOutcome::Completed { turns: 1, stop_reason: "end_turn".into() });
+
+        let reqs = tr.seen_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let last_msg = reqs[0].messages.last().expect("first request must carry user message");
+        assert_eq!(last_msg.role, crate::transport::Role::User);
+        let ContentBlock::Text { text } = &last_msg.content[0] else {
+            panic!("expected user text block, got {:?}", last_msg.content);
+        };
+        assert!(!text.trim().is_empty());
+        assert!(text.contains("Solve 1+1"), "first user turn must include setup statement: {text}");
+
+        // Must also serialize cleanly for the ChatGPT Responses API route without `input: []`.
+        let wire: Value =
+            serde_json::from_slice(&crate::responses::serialize_responses_request(&reqs[0]).unwrap()).unwrap();
+        let input = wire["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert!(input[0]["content"].as_str().unwrap_or("").contains("Solve 1+1"));
+
+        let evs = ledger.read_session(&sid).unwrap();
+        let start_ev = evs.iter().find(|e| e.kind == "session.start").unwrap();
+        assert_eq!(start_ev.payload["prompt"], raw_prompt);
+        assert_eq!(
+            start_ev.payload["first_user_text_sha256"].as_str().unwrap(),
+            ledger::sha256_hex(text.as_bytes()),
+        );
+    }
+}

@@ -224,7 +224,8 @@ export function applyPrefillToState(state, resp) {
     proveNotice: taskKind === 'prove' ? (p.prove_notice || PROVE_PROSE_NOTICE) : null,
     toolbox: resp.toolbox || state.toolbox,
     approvalGrants: resp.approval_grants || state.approvalGrants,
-    modelConnected: typeof resp.model_connected === 'boolean' ? resp.model_connected : state.modelConnected,
+    modelConnected: (typeof resp.model_connected === 'boolean' ? resp.model_connected : state.modelConnected)
+      || (Array.isArray(state.connectedModels) && state.connectedModels.length > 0),
     error: '',
   };
   if (resp.roles?.solver) next.solver = { ...resp.roles.solver };
@@ -236,7 +237,8 @@ export function applyPrefillToState(state, resp) {
 
 export function applySolveViewToState(state, view) {
   if (!view || typeof view !== 'object') return state;
-  const setup = view.setup || null;
+  const setup = view.setup !== undefined ? (view.setup || null) : state.setup;
+  const connectedModels = Array.isArray(view.connected_models) ? view.connected_models : state.connectedModels;
   const next = {
     ...state,
     setup,
@@ -251,9 +253,11 @@ export function applySolveViewToState(state, view) {
     runState: view.run_state || state.runState,
     toolbox: view.toolbox || state.toolbox,
     approvalGrants: view.approval_grants || state.approvalGrants,
-    modelConnected: typeof view.model_connected === 'boolean' ? view.model_connected : state.modelConnected,
+    modelConnected: (typeof view.model_connected === 'boolean' ? view.model_connected : state.modelConnected)
+      || (Array.isArray(connectedModels) && connectedModels.length > 0),
+    connectedModels,
   };
-  if (setup && state.phase !== 'revising') {
+  if (view.setup !== undefined && setup && state.phase !== 'revising') {
     next.phase = 'collapsed';
     next.statement = String(setup.statement || '');
     next.taskKind = setup.task_kind || 'calculate';

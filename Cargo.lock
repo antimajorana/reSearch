@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chatgpt-auth",
  "ledger",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "chatgpt-auth"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chatgpt-auth",
  "getrandom 0.2.17",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent",
  "cli-route",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "cli-route"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ledger",
  "policy",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "desktop-server",
  "research-tools",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent",
  "chatgpt-auth",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "export"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.2.17",
  "ledger",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "ledger"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cli-route",
  "ledger",
@@ -2016,7 +2016,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "policy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
@@ -2221,7 +2221,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "research-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "ledger",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.2.17",
  "ledger",
@@ -3621,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",

@@ -170,6 +170,7 @@ function makeStageDom() {
 
   const prevDoc = globalThis.document;
   const prevStages = globalThis.__reSearchModeStages;
+  const docListeners = new Map();
   const doc = {
     head,
     createElement: (tag) => { const n = makeEl(tag, null); n.ownerDocument = doc; return n; },
@@ -177,6 +178,9 @@ function makeStageDom() {
     createTextNode: (txt) => { const n = makeEl('#text', null); n.textContent = String(txt ?? ''); n.ownerDocument = doc; return n; },
     getElementById: (id) => byId.get(id) || null,
     querySelector: (sel) => head.querySelector(sel) || shell.querySelector(sel) || null,
+    addEventListener: (t, fn) => { if (!docListeners.has(t)) docListeners.set(t, []); docListeners.get(t).push(fn); },
+    removeEventListener: (t, fn) => { if (docListeners.has(t)) docListeners.set(t, docListeners.get(t).filter((f) => f !== fn)); },
+    dispatchEvent: (ev) => { for (const fn of docListeners.get(ev?.type) || []) fn(ev); },
   };
   for (const n of [head, shell, homeExplore, exploreStage, solveStage, activeTitle]) n.ownerDocument = doc;
   globalThis.document = doc;
@@ -489,6 +493,97 @@ test('project_library.js mounts library_send_back.js (Export BibTeX + Send to Ka
     assert.equal(posted[1].body.user_initiated, true);
   } finally {
     globalThis.fetch = prevFetch;
+    dom.restore();
+  }
+});
+
+test('mode_stages.js populates Solver dropdown with connected models, refreshes on models-updated, and auto-starts first leg unless ask_before_running', async () => {
+  const dom = makeStageDom();
+  try {
+    const calls = [];
+    const stages = createModeStagesController({
+      isModelConnected: () => true,
+      listConnectedModels: () => ({
+        providers: [
+          { id: 'claude-cli', label: 'Claude Code', route: 'claude-cli', models: [{ id: 'sonnet', label: 'Sonnet' }] },
+          {
+            id: 'chatgpt',
+            label: 'ChatGPT',
+            route: 'api',
+            models: [
+              { id: 'gpt-6.2-sol', label: 'gpt-6.2-sol' },
+              { id: 'gpt-5.4', label: 'gpt-5.4' },
+            ],
+          },
+        ],
+      }),
+      solveOpts: { debounceMs: 0 },
+      fetchJson: async (method, url, body) => {
+        calls.push({ method, url, body });
+        if (method === 'GET' && url.endsWith('/solve/view')) {
+          return { setup: null, steps: [], handles: [], checks: [], receipts: [], model_connected: true };
+        }
+        if (method === 'POST' && url.endsWith('/solve/prefill')) {
+          return { prefill: { task_kind: 'calculate' }, model_connected: true };
+        }
+        if (method === 'POST' && url.endsWith('/solve/setup')) {
+          return {
+            setup: { ...body, revision: 1 },
+            view: { setup: { ...body, revision: 1 }, steps: [], model_connected: true },
+          };
+        }
+        if (method === 'POST' && url.endsWith('/solve/continue')) {
+          return {
+            ok: true,
+            accepted: true,
+            view: { setup: { statement: 'Compute x^2', revision: 1 }, steps: [], run_state: { state: 'running', running: false }, model_connected: true },
+          };
+        }
+        throw new Error(`Unexpected URL: ${method} ${url}`);
+      },
+    });
+
+    await stages.syncFromRail('s-run-auto', [{ id: 's-run-auto', mode: 'solve' }]);
+    const solverSelect = dom.solveStage.querySelector('[data-testid="solve-solver-select"]');
+    assert.ok(solverSelect);
+    assert.deepEqual(
+      solverSelect.children.map((o) => o.value),
+      ['', 'chatgpt::gpt-6.2-sol', 'chatgpt::gpt-5.4'],
+    );
+    assert.equal(solverSelect.children[0].textContent, 'Not selected');
+
+    // Refresh model list event adds a third model without losing typed statement.
+    const stmt = dom.solveStage.querySelector('[data-testid="solve-statement-input"]');
+    stmt.value = 'Compute $\\int_0^1 x^2\\,dx$.';
+    stmt.dispatch('input');
+    globalThis.document.dispatchEvent({
+      type: 'research:models-updated',
+      detail: { providers: [{ id: 'openai', label: 'OpenAI', route: 'api', models: [{ id: 'gpt-4.1', label: 'gpt-4.1' }] }] },
+    });
+    const refreshedSel = dom.solveStage.querySelector('[data-testid="solve-solver-select"]');
+    assert.deepEqual(refreshedSel.children.map((o) => o.value), ['', 'openai::gpt-4.1']);
+
+    // Run with ask_before_running unchecked -> posts setup AND chains solve/continue; Save revision does not re-start.
+    await stages.getSolveView().submitSetup();
+    assert.ok(calls.some((c) => c.url === '/api/sessions/s-run-auto/solve/continue'));
+    calls.length = 0;
+    dom.solveStage.querySelector('[data-action="edit-setup"]').dispatch('click');
+    await stages.getSolveView().submitSetup();
+    assert.equal(calls.some((c) => c.url.endsWith('/solve/continue')), false, 'Save revision must not auto-continue');
+
+    // Fresh session with ask_before_running checked -> saves setup ONLY, no solve/continue.
+    calls.length = 0;
+    await stages.syncFromRail('s-run-ask', [{ id: 's-run-ask', mode: 'solve' }]);
+    const stmt2 = dom.solveStage.querySelector('[data-testid="solve-statement-input"]');
+    stmt2.value = 'Prove $x^2 \\ge 0$';
+    stmt2.dispatch('input');
+    const askBox = dom.solveStage.querySelector('[data-testid="solve-ask-before-running"]');
+    askBox.checked = true;
+    askBox.dispatch('change');
+    await stages.getSolveView().submitSetup();
+    assert.ok(calls.some((c) => c.url === '/api/sessions/s-run-ask/solve/setup'));
+    assert.equal(calls.some((c) => c.url.endsWith('/solve/continue')), false);
+  } finally {
     dom.restore();
   }
 });

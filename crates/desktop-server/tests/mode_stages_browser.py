@@ -105,5 +105,49 @@ def check_mode_stages(browser, binary):
             send_back.locator(".send-back-export-btn").click()
             expect(send_back.locator(".send-back-dialog")).to_be_visible()
 
+            # 5. Investigate setup renders its "Investigate a paper" heading only once (no duplicate heading).
+            page.locator("#new-investigation-btn").click()
+            expect(page.locator("#investigation-setup")).to_be_visible()
+            expect(page.get_by_role("heading", name="Investigate a paper", exact=True)).to_have_count(1)
+
+            # 6. With two connected models, Solve's Solver dropdown lists both plus "Not selected",
+            #    and clicking Run with "Ask before running" unchecked starts the first leg automatically.
+            continue_calls = []
+            page.unroute("**/api/models*")
+            page.route(
+                "**/api/models*",
+                lambda r: r.fulfill(
+                    json={
+                        "providers": [
+                            {
+                                "id": "chatgpt",
+                                "label": "ChatGPT",
+                                "route": "api",
+                                "models": [
+                                    {"id": "gpt-6.2-sol", "label": "gpt-6.2-sol", "default": True},
+                                    {"id": "gpt-5.4", "label": "gpt-5.4", "default": False},
+                                ],
+                            }
+                        ]
+                    }
+                ),
+            )
+            page.route(
+                "**/solve/continue",
+                lambda r: (continue_calls.append(r.request.url), r.fulfill(status=202, json={"ok": True, "accepted": True})),
+            )
+            page.locator("#new-solve-btn").click()
+            solver_opts = solve_stage.locator('[data-testid="solve-solver-select"] option')
+            expect(solver_opts).to_have_count(3)
+            expect(solver_opts.nth(0)).to_have_text("Not selected")
+            expect(solver_opts.nth(1)).to_contain_text("gpt-6.2-sol")
+            expect(solver_opts.nth(2)).to_contain_text("gpt-5.4")
+            solver_opts_select = solve_stage.locator('[data-testid="solve-solver-select"]')
+            solver_opts_select.select_option("chatgpt::gpt-6.2-sol")
+            solve_stage.locator('[data-testid="solve-statement-input"]').fill(r"Compute $\int_0^1 x^2\,dx$.")
+            with page.expect_response("**/solve/continue"):
+                solve_stage.locator('[data-testid="solve-run-btn"]').click()
+            assert len(continue_calls) == 1, continue_calls
+
             assert not errors, errors
     print("Mode stages (Solve setup, Explore shell, and Library send-back) browser check passed")
